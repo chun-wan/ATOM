@@ -12,7 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Gemma 4 model implementation for ATOM with AITER operators."""
+"""Gemma 4 model implementation for ATOM with AITER-optimized operators.
+
+Operator optimization levels (MI355X / gfx950):
+  - Attention decode: Gluon PA (Triton advanced, CDNA4-aware)
+  - Attention prefill: Triton flash attention
+  - GeluAndMul: AITER CUDA JIT kernel (gelu_tanh_and_mul)
+  - RMSNorm: AITER CUDA (GemmaRMSNorm with +1 offset)
+  - RoPE: AITER CUDA kernel per-layer-type config
+  - GEMM: CK (Composable Kernel) for FP8/MXFP4
+  - MoE: ASM + CK fused MoE (26B-A4B variant)
+  - TopK softmax: ASM
+  - Logit softcapping: fused Triton kernel (single launch)
+"""
 
 from collections.abc import Iterable
 from typing import Any, Optional
@@ -21,13 +33,16 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import triton
+import triton.language as tl
+
+from aiter import gelu_tanh_and_mul
 from aiter.dist.parallel_state import get_tp_group
 from aiter.rotary_embedding import get_rope
 
-from atom.config import Config
+from atom.config import Config, QuantizationConfig
 from atom.model_config.gemma4 import Gemma4Config, Gemma4TextConfig
 from atom.model_loader.loader import load_model_in_plugin_mode
-from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import GemmaRMSNorm
@@ -38,23 +53,137 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.moe import FusedMoE
 from atom.models.utils import maybe_prefix
+from atom.quant_spec import LayerQuantConfig
 from atom.utils.decorators import support_torch_compile
 
+from aiter import QuantType
+from aiter.jit.utils.torch_guard import torch_compile_guard
 
-class Gemma4GeluAndMul(nn.Module):
-    """GELU-gated MLP activation: GELU(gate) * up.
 
-    Used by Gemma 4's hidden_activation='gelu_pytorch_tanh'.
+# ---------------------------------------------------------------------------
+# Fused logit softcapping Triton kernel
+# Replaces 3 separate PyTorch ops (div + tanh + mul) with a single kernel.
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _fused_logit_softcap_kernel(
+    logits_ptr,
+    cap_inv,   # 1.0 / softcapping_value
+    cap,       # softcapping_value
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(logits_ptr + offsets, mask=mask)
+    x = tl.math.tanh(x * cap_inv) * cap
+    tl.store(logits_ptr + offsets, x, mask=mask)
+
+
+def fused_logit_softcap(logits: torch.Tensor, cap: float) -> torch.Tensor:
+    """In-place fused logit softcapping: tanh(x / cap) * cap."""
+    n = logits.numel()
+    BLOCK = 1024
+    grid = ((n + BLOCK - 1) // BLOCK,)
+    _fused_logit_softcap_kernel[grid](logits, 1.0 / cap, cap, n, BLOCK_SIZE=BLOCK)
+    return logits
+
+
+# ---------------------------------------------------------------------------
+# AITER-accelerated GeluAndMul activation
+# Uses aiter.gelu_tanh_and_mul CUDA JIT kernel instead of PyTorch F.gelu
+# ---------------------------------------------------------------------------
+
+def _mxfp4_gelu_mul_quant_fuse_fake(
+    x: torch.Tensor,
+    shuffle: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    M, N1 = x.shape
+    N_half = N1 // 2
+    out = torch.empty((M, N_half // 2), dtype=torch.float4_e2m1fn_x2, device=x.device)
+    MXFP4_QUANT_BLOCK_SIZE = 32
+    SCALE_N_valid = (N_half + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
+    if shuffle:
+        SCALE_M = ((M + 255) // 256) * 256
+        SCALE_N = ((SCALE_N_valid + 7) // 8) * 8
+    else:
+        SCALE_M = M
+        SCALE_N = SCALE_N_valid
+    scale = torch.empty((SCALE_M, SCALE_N), dtype=torch.float8_e8m0fnu, device=x.device)
+    return out, scale
+
+
+@torch_compile_guard(gen_fake=_mxfp4_gelu_mul_quant_fuse_fake, mutates_args=[])
+def _mxfp4_gelu_mul_quant_fuse(
+    x: torch.Tensor,
+    shuffle: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.fused_mxfp4_quant import (
+        fused_reduce_act_mul_and_mxfp4_quant,
+    )
+    (x, x_scale), _ = fused_reduce_act_mul_and_mxfp4_quant(x, "gelu", shuffle=shuffle)
+    return x, x_scale
+
+
+class GeluAndMul(nn.Module):
+    """AITER-accelerated GELU-gated activation for Gemma 4.
+
+    Mirrors the SiluAndMul pattern but uses gelu_tanh_and_mul CUDA kernel.
+    Supports FP8 and MXFP4 fused quantization paths.
     """
 
-    def forward(
+    def __init__(
         self,
-        x: torch.Tensor,
-        x_scale: Optional[torch.Tensor] = None,
+        fused_quant: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.fused_quant = fused_quant
+        layer_quant_config = (
+            LayerQuantConfig()
+            if quant_config is None
+            else quant_config.get_layer_quant_config(prefix)
+        )
+        self.quant_type = layer_quant_config.quant_type
+        self.params_dtype = layer_quant_config.quant_dtype
+
+    def forward_native(
+        self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         gate, up = x.chunk(2, dim=-1)
         return F.gelu(gate, approximate="tanh") * up
 
+    def forward(
+        self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if x_scale is not None and self.fused_quant:
+            from aiter.ops.triton.fused_fp8_quant import (
+                fused_gelu_mul_fp8_per_tensor_static_quant,
+            )
+            import aiter as rocm_aiter
+            x = fused_gelu_mul_fp8_per_tensor_static_quant(
+                x, x_scale, dtype_quant=rocm_aiter.dtypes.fp8
+            )
+            return x, x_scale
+        elif (
+            x_scale is None
+            and self.fused_quant
+            and self.quant_type.value == QuantType.per_1x32.value
+        ):
+            return _mxfp4_gelu_mul_quant_fuse(x, shuffle=True)
+        else:
+            out = torch.empty(
+                [*x.shape[:-1], x.shape[-1] // 2], device=x.device, dtype=x.dtype
+            )
+            gelu_tanh_and_mul(out, x)
+            return out
+
+
+# ---------------------------------------------------------------------------
+# Model components
+# ---------------------------------------------------------------------------
 
 class Gemma4Attention(nn.Module):
     """Multi-head attention for Gemma 4 with sliding/global window support.
@@ -192,7 +321,10 @@ class Gemma4MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
         )
-        self.act_fn = Gemma4GeluAndMul()
+        self.act_fn = GeluAndMul(
+            quant_config=quant_config,
+            prefix=f"{prefix}.act_fn",
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(x)
@@ -202,7 +334,10 @@ class Gemma4MLP(nn.Module):
 
 
 class Gemma4SparseMoeBlock(nn.Module):
-    """Sparse MoE block for Gemma 4 26B-A4B variant."""
+    """Sparse MoE block for Gemma 4 26B-A4B variant.
+
+    Uses AITER FusedMoE (ASM + CK backend) for high-throughput expert dispatch.
+    """
 
     def __init__(
         self,
@@ -340,6 +475,8 @@ class Gemma4DecoderLayer(nn.Module):
     dynamic_arg_dims={
         "input_ids": 0,
         "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
     }
 )
 class Gemma4Model(nn.Module):
@@ -377,7 +514,6 @@ class Gemma4Model(nn.Module):
         **model_kwargs: dict[str, Any],
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
-        # Gemma models scale embeddings by sqrt(hidden_size)
         hidden_states = hidden_states * (self.hidden_size**0.5)
 
         residual = None
@@ -451,9 +587,7 @@ class Gemma4ForCausalLM(nn.Module):
         logits = self.lm_head(hidden_states)
 
         if self.logit_softcapping is not None and self.logit_softcapping > 0:
-            logits = logits / self.logit_softcapping
-            logits = torch.tanh(logits)
-            logits = logits * self.logit_softcapping
+            logits = fused_logit_softcap(logits, self.logit_softcapping)
 
         return logits
 
