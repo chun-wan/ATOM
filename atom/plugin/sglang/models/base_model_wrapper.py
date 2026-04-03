@@ -35,6 +35,7 @@ def get_current_forward_batch():
 _MODEL_NAMES = [
     "DeepseekV3ForCausalLM",
     "Qwen3MoeForCausalLM",
+    "Gemma4ForCausalLM",
 ]
 
 _DEEPSEEK_ARCHS = {
