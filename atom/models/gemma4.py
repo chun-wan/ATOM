@@ -185,6 +185,18 @@ class GeluAndMul(nn.Module):
 # Model components
 # ---------------------------------------------------------------------------
 
+
+class _GemmaNormWrapper:
+    """Wraps GemmaRMSNorm to expose (weight+1) as .weight for fused kernels."""
+    def __init__(self, gemma_norm):
+        self._norm = gemma_norm
+    @property
+    def weight(self):
+        return self._norm.weight.data + 1.0
+    @property
+    def eps(self):
+        return self._norm.variance_epsilon
+
 class Gemma4Attention(nn.Module):
     """Multi-head attention for Gemma 4 with sliding/global window support.
 
@@ -260,6 +272,12 @@ class Gemma4Attention(nn.Module):
         )
 
         sw = sliding_window if not is_global else None
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=rms_norm_eps)
+        # Pass wrapped norms to Attention for fused QK-norm-RoPE path
+        # Only enable fused path for non-k_eq_v layers (sliding attention)
+        q_norm_for_attn = _GemmaNormWrapper(self.q_norm) if not attention_k_eq_v else None
+        k_norm_for_attn = _GemmaNormWrapper(self.k_norm) if not attention_k_eq_v else None
         self.attn = Attention(
             num_heads=self.num_heads,
             head_dim=self.head_dim,
@@ -271,10 +289,10 @@ class Gemma4Attention(nn.Module):
             rotary_emb=self.rotary_emb,
             config=atom_config,
             sliding_window=sw,
+            q_norm=q_norm_for_attn,
+            k_norm=k_norm_for_attn,
             prefix=f"{prefix}.attn",
         )
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(
         self,
@@ -286,13 +304,15 @@ class Gemma4Attention(nn.Module):
         q, k, v = torch.split(
             qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
         )
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-
         if self.attention_k_eq_v:
+            # Full-attention layers: manual norm (fused path disabled for k_eq_v)
+            q = self.q_norm(q)
+            k = self.k_norm(k)
             v = k
-
-        o = self.attn(q, k, v, positions, **model_kwargs)
+            o = self.attn(q, k, v, positions, **model_kwargs)
+        else:
+            # Sliding layers: norms handled by fused QK-norm-RoPE kernel
+            o = self.attn(q, k, v, positions, qkv=qkv, **model_kwargs)
         output = self.o_proj(o)
         return output
 
@@ -599,4 +619,7 @@ class Gemma4ForCausalLM(nn.Module):
             config=self.atom_config,
             prefix="model.",
         )
+        for module in self.modules():
+            if hasattr(module, '_invalidate_weight_cache'):
+                module._invalidate_weight_cache()
         return loaded_weights_record
