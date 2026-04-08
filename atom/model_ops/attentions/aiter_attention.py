@@ -35,6 +35,10 @@ class AiterBackend(AttentionBackend):
     def is_ssm(cls) -> bool:
         return False
 
+    @classmethod
+    def get_preferred_block_size(cls) -> int:
+        return 16
+
     @staticmethod
     def get_name() -> str:
         return "ROCM_AITER_ATTENTION" if not is_plugin_mode() else "CUSTOM"
