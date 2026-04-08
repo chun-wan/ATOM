@@ -31,6 +31,10 @@ def cdiv(a, b):
 
 @AiterBackendDecoratorForPluginMode
 class AiterBackend(AttentionBackend):
+    @classmethod
+    def is_ssm(cls) -> bool:
+        return False
+
     @staticmethod
     def get_name() -> str:
         return "ROCM_AITER_ATTENTION" if not is_plugin_mode() else "CUSTOM"
