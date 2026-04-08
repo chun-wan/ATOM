@@ -77,16 +77,13 @@ def _fused_logit_softcap_kernel(
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
     x = tl.load(logits_ptr + offsets, mask=mask)
-    x = tl.math.tanh(x * cap_inv) * cap
+    x = tl.libdevice.tanh(x * cap_inv) * cap
     tl.store(logits_ptr + offsets, x, mask=mask)
 
 
 def fused_logit_softcap(logits: torch.Tensor, cap: float) -> torch.Tensor:
-    """In-place fused logit softcapping: tanh(x / cap) * cap."""
-    n = logits.numel()
-    BLOCK = 1024
-    grid = ((n + BLOCK - 1) // BLOCK,)
-    _fused_logit_softcap_kernel[grid](logits, 1.0 / cap, cap, n, BLOCK_SIZE=BLOCK)
+    """In-place logit softcapping: tanh(x / cap) * cap."""
+    logits.div_(cap).tanh_().mul_(cap)
     return logits
 
 
@@ -186,17 +183,6 @@ class GeluAndMul(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class _GemmaNormWrapper:
-    """Wraps GemmaRMSNorm to expose (weight+1) as .weight for fused kernels."""
-    def __init__(self, gemma_norm):
-        self._norm = gemma_norm
-    @property
-    def weight(self):
-        return self._norm.weight.data + 1.0
-    @property
-    def eps(self):
-        return self._norm.variance_epsilon
-
 class Gemma4Attention(nn.Module):
     """Multi-head attention for Gemma 4 with sliding/global window support.
 
@@ -263,21 +249,27 @@ class Gemma4Attention(nn.Module):
         if partial_rotary_factor < 1.0:
             rotary_dim = int(head_dim * partial_rotary_factor)
 
+        # AITER get_rope doesn't support rope_type="proportional" -- convert to "default"
+        clean_rope_scaling = None
+        if rope_scaling:
+            rtype = rope_scaling.get("rope_type", "default")
+            if rtype in ("proportional", "default"):
+                clean_rope_scaling = None  # use plain RoPE with base=rope_theta
+            else:
+                clean_rope_scaling = dict(rope_scaling)
+
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=rotary_dim,
             max_position=max_position,
             base=rope_theta,
-            rope_scaling=rope_scaling,
+            rope_scaling=clean_rope_scaling,
         )
 
         sw = sliding_window if not is_global else None
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=rms_norm_eps)
-        # Pass wrapped norms to Attention for fused QK-norm-RoPE path
-        # Only enable fused path for non-k_eq_v layers (sliding attention)
-        q_norm_for_attn = _GemmaNormWrapper(self.q_norm) if not attention_k_eq_v else None
-        k_norm_for_attn = _GemmaNormWrapper(self.k_norm) if not attention_k_eq_v else None
+        self.v_norm = GemmaRMSNorm(self.head_dim, eps=rms_norm_eps)
         self.attn = Attention(
             num_heads=self.num_heads,
             head_dim=self.head_dim,
@@ -288,9 +280,7 @@ class Gemma4Attention(nn.Module):
             use_mla=False,
             rotary_emb=self.rotary_emb,
             config=atom_config,
-            sliding_window=sw,
-            q_norm=q_norm_for_attn,
-            k_norm=k_norm_for_attn,
+            per_layer_sliding_window=sw,
             prefix=f"{prefix}.attn",
         )
 
@@ -304,15 +294,21 @@ class Gemma4Attention(nn.Module):
         q, k, v = torch.split(
             qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
         )
-        if self.attention_k_eq_v:
-            # Full-attention layers: manual norm (fused path disabled for k_eq_v)
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-            v = k
-            o = self.attn(q, k, v, positions, **model_kwargs)
-        else:
-            # Sliding layers: norms handled by fused QK-norm-RoPE kernel
-            o = self.attn(q, k, v, positions, qkv=qkv, **model_kwargs)
+        # Reshape to per-head, apply norm, reshape back (vLLM pattern)
+        q = q.unflatten(-1, (self.num_heads, self.head_dim))
+        q = self.q_norm(q)
+        q = q.flatten(-2, -1)
+
+        k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+        k = self.k_norm(k)
+        k = k.flatten(-2, -1)
+
+        if not self.attention_k_eq_v:
+            v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            v = self.v_norm(v)
+            v = v.flatten(-2, -1)
+
+        o = self.attn(q, k, v, positions, **model_kwargs)
         output = self.o_proj(o)
         return output
 
@@ -531,6 +527,8 @@ class Gemma4Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        intermediate_tensors=None,
+        inputs_embeds: torch.Tensor | None = None,
         **model_kwargs: dict[str, Any],
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
@@ -551,12 +549,22 @@ class Gemma4Model(nn.Module):
 
 class Gemma4ForCausalLM(nn.Module):
     packed_modules_mapping = {
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+        # QKV packing only applies to sliding layers (which have qkv_proj).
+        # Full-attention layers have separate q_proj/k_proj (loaded directly).
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
         "v_proj": ("qkv_proj", "v"),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
     }
+
+    weights_mapping = {"language_model.": ""}
+
+    skip_weight_prefixes = [
+        "model.vision_tower.",
+        "model.embed_vision.",
+        "model.multi_modal_projector.",
+    ]
 
     def __init__(self, config: Any, prefix: str = "") -> None:
         super().__init__()
@@ -622,4 +630,12 @@ class Gemma4ForCausalLM(nn.Module):
         for module in self.modules():
             if hasattr(module, '_invalidate_weight_cache'):
                 module._invalidate_weight_cache()
+        # Copy K weights to V slot for k_eq_v layers (V=K, no v_proj in checkpoint)
+        for layer in self.model.layers:
+            attn = layer.self_attn
+            if getattr(attn, 'attention_k_eq_v', False) and hasattr(attn, 'qkv_proj'):
+                w = attn.qkv_proj.weight.data
+                q_sz = attn.q_size
+                kv_sz = attn.kv_size
+                w[q_sz + kv_sz : q_sz + 2*kv_sz].copy_(w[q_sz : q_sz + kv_sz])
         return loaded_weights_record
