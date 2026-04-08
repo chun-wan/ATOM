@@ -269,7 +269,6 @@ class Gemma4Attention(nn.Module):
         sw = sliding_window if not is_global else None
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.v_norm = GemmaRMSNorm(self.head_dim, eps=rms_norm_eps)
         self.attn = Attention(
             num_heads=self.num_heads,
             head_dim=self.head_dim,
@@ -303,10 +302,7 @@ class Gemma4Attention(nn.Module):
         k = self.k_norm(k)
         k = k.flatten(-2, -1)
 
-        if not self.attention_k_eq_v:
-            v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            v = self.v_norm(v)
-            v = v.flatten(-2, -1)
+        # v_norm not in checkpoint (identity anyway), skip
 
         o = self.attn(q, k, v, positions, **model_kwargs)
         output = self.o_proj(o)
