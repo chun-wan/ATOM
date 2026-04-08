@@ -19,7 +19,14 @@ from aiter import (
 )
 from aiter.dist.parallel_state import get_dp_group
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
-from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
+# Lazy import: avoid crash when AITER version doesn't have this module
+gather_kv_b_proj = None
+def _get_gather_kv_b_proj():
+    global gather_kv_b_proj
+    if gather_kv_b_proj is None:
+        from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj as _fn
+        gather_kv_b_proj = _fn
+    return gather_kv_b_proj
 from atom.config import get_current_atom_config
 from atom.model_ops.linear import use_triton_gemm
 from atom.model_ops.utils import get_and_maybe_dequant_weights
@@ -677,7 +684,7 @@ class MLAAttention(nn.Module):
                     dtype=self.dtype,
                 )
 
-                gather_kv_b_proj(
+                _get_gather_kv_b_proj()(
                     kv_cache,
                     self._k_scale,
                     attn_metadata.kv_indptr,
