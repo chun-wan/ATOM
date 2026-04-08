@@ -36,8 +36,8 @@ class AiterBackend(AttentionBackend):
         return False
 
     @classmethod
-    def get_preferred_block_size(cls) -> int:
-        return 16
+    def get_preferred_block_size(cls, default_block_size: int = 16) -> int:
+        return default_block_size
 
     @staticmethod
     def get_name() -> str:
