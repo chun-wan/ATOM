@@ -45,7 +45,14 @@ from aiter.ops.triton.fused_fp8_quant import (
     fused_reduce_rms_fp8_group_quant,
     fused_rms_fp8_group_quant,
 )
-from aiter import fused_qk_rmsnorm
+# Lazy import: may not exist in older aiter versions
+fused_qk_rmsnorm = None
+def _get_fused_qk_rmsnorm():
+    global fused_qk_rmsnorm
+    if fused_qk_rmsnorm is None:
+        from aiter import fused_qk_rmsnorm as _fn
+        fused_qk_rmsnorm = _fn
+    return fused_qk_rmsnorm
 from aiter.ops.triton.fused_mxfp4_quant import (
     fused_reduce_rms_mxfp4_quant,
     fused_rms_mxfp4_quant,
@@ -703,7 +710,7 @@ def _fused_qk_rmsnorm(
     kv_a_layernorm_weight: torch.Tensor,
     kv_a_layernorm_variance_epsilon: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    return fused_qk_rmsnorm(
+    return _get_fused_qk_rmsnorm()(
         q_c,
         q_a_layernorm_weight,
         q_a_layernorm_variance_epsilon,
